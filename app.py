@@ -2,163 +2,185 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import os
 import requests
-import json 
+import json
 import logging
+import threading
+import time
+from datetime import datetime
 
-# Configuración del logging para ver errores en Render
-# Necesario para que Render/Gunicorn muestre errores claros
-logging.basicConfig(level=logging.INFO) 
+logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
-
-# Cargar las variables del archivo .env (solo para prueba local, Render usa sus variables)
 load_dotenv()
 
-# --- Configuración (Obtenida de variables de entorno) ---
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID") 
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
-# --- Función para Enviar Mensajes ---
-def send_whatsapp_message(to_number, text_message):
-    """Envía un mensaje de texto a un número de WhatsApp."""
-    
-    # Verifica que las credenciales críticas estén presentes
+# -----------------------------
+#   MEMORIA TEMPORAL
+# -----------------------------
+pending_event = {}   # Guarda el progreso del usuario con /crear_evento
+event_list = []      # Aquí se guardarán los eventos definitivos
+
+
+# -----------------------------
+#   ENVIAR MENSAJES
+# -----------------------------
+def send_whatsapp_message(to, text):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        app.logger.error("Faltan WHATSAPP_TOKEN o PHONE_NUMBER_ID. No se puede enviar el mensaje.")
-        return False
-        
+        return
+
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
-    
     data = {
         "messaging_product": "whatsapp",
-        "to": to_number,
+        "to": to,
         "type": "text",
-        "text": {"body": text_message}
+        "text": {"body": text}
     }
-    
-    try:
-        response = requests.post(url, headers=headers, data=json.dumps(data), timeout=15)
-        
-        if response.status_code != 200:
-            # Si Meta devuelve un error, lo registramos claramente en Render
-            error_data = response.json()
-            app.logger.error(f"ERROR API Meta (Código {response.status_code}): {error_data}")
-            return False
-        
-        app.logger.info(f"Mensaje enviado con éxito a {to_number}")
-        return True
-
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"ERROR de conexión al enviar mensaje: {e}")
-        return False
+    requests.post(url, headers=headers, data=json.dumps(data))
 
 
-# --- Lógica de Comandos ---
-def handle_commands(sender_id, message_text):
-    """Procesa los comandos y devuelve la respuesta apropiada."""
-    
-    msg_lower = message_text.lower().strip()
+# -----------------------------
+#   RECORDATORIOS AUTOMÁTICOS
+# -----------------------------
+def reminder_loop():
+    while True:
+        now = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    # Mensaje de respuesta por defecto
-    default_text = (
-        "🤖 ¡Hola! Gracias por tu mensaje. 🤖\n\n"
-        "Escribiste: *{text_received}*\n\n"
-        "Si necesitas ayuda, usa el comando */help* para ver el menú de opciones."
-    ).format(text_received=message_text)
-    
-    response_text = ""
+        for event in event_list[:]:
+            if event["datetime"] == now:
+                send_whatsapp_message(event["user"], f"⏰ *Recordatorio:* {event['motivo']}")
+                event_list.remove(event)
 
-    # 1. Comando /help
-    if msg_lower == "/help":
-        response_text = (
-            "🤖 **Menú de Ayuda del Bot** 🤖\n"
-            "Los comandos disponibles son:\n"
-            "*/help* - Muestra este menú.\n"
-            "*/bienvenida* - Envía un saludo personalizado.\n"
-            "*/status* - Verifica el estado del bot."
+        time.sleep(30)  # revisa cada 30 segundos
+
+
+# Iniciar hilo de recordatorios
+threading.Thread(target=reminder_loop, daemon=True).start()
+
+
+
+# -----------------------------
+#   MANEJO DE COMANDOS
+# -----------------------------
+def handle_commands(user, text):
+
+    # 🔥 Si está creando un evento, manejar flujo paso a paso
+    if user in pending_event:
+        step = pending_event[user]["step"]
+
+        # 1️⃣ FECHA
+        if step == "fecha":
+            pending_event[user]["fecha"] = text.strip()
+            pending_event[user]["step"] = "hora"
+            send_whatsapp_message(user, "📌 Ahora dime la *hora* (HH:MM)")
+            return
+
+        # 2️⃣ HORA
+        if step == "hora":
+            pending_event[user]["hora"] = text.strip()
+            pending_event[user]["step"] = "motivo"
+            send_whatsapp_message(user, "📝 ¿Cuál es el *motivo* del recordatorio?")
+            return
+
+        # 3️⃣ MOTIVO
+        if step == "motivo":
+            fecha = pending_event[user]["fecha"]
+            hora = pending_event[user]["hora"]
+            motivo = text.strip()
+
+            # Combinar fecha y hora
+            try:
+                fecha_hora = datetime.strptime(f"{fecha} {hora}", "%d/%m/%Y %H:%M")
+            except:
+                send_whatsapp_message(user, "❌ Formato incorrecto. Usa DD/MM/AAAA y HH:MM")
+                del pending_event[user]
+                return
+
+            event_list.append({
+                "user": user,
+                "motivo": motivo,
+                "datetime": fecha_hora.strftime("%d/%m/%Y %H:%M")
+            })
+
+            send_whatsapp_message(user, f"✅ *Evento creado*\n📅 {fecha}\n⏰ {hora}\n📝 {motivo}\n\nTe lo recordaré a esa hora.")
+
+            del pending_event[user]
+            return
+
+
+    # -----------------------
+    #   COMANDOS NORMALES
+    # -----------------------
+
+    t = text.lower().strip()
+
+    if t == "/crear_evento":
+        pending_event[user] = {"step": "fecha"}
+        send_whatsapp_message(user, "📅 Dime la *fecha* del evento (DD/MM/AAAA):")
+        return
+
+    if t == "/help":
+        menu = (
+            "📘 *Menú de Ayuda*\n\n"
+            "/help - Mostrar comandos\n"
+            "/bienvenida - Saludo\n"
+            "/status - Estado del bot\n"
+            "/crear_evento - Programar recordatorio automático\n"
         )
-    
-    # 2. Comando /bienvenida
-    elif msg_lower == "/bienvenida":
-        response_text = (
-            "¡Bienvenido! 👋 Soy tu bot de prueba, funcionando en Render. "
-            "Estoy listo para recibir tus comandos."
-        )
+        send_whatsapp_message(user, menu)
+        return
 
-    # 3. Comando /status
-    elif msg_lower == "/status":
-        response_text = "🟢 **ESTADO:** Operacional (Live on Render)."
-        
-    # 4. Respuesta por defecto a CUALQUIER otro texto
-    else:
-        response_text = default_text
-        
-    # Enviar la respuesta
-    send_whatsapp_message(sender_id, response_text)
+    if t == "/bienvenida":
+        send_whatsapp_message(user, "👋 ¡Bienvenido! Soy tu bot funcionando en Render.")
+        return
+
+    if t == "/status":
+        send_whatsapp_message(user, "🟢 Bot funcionando (Render online)")
+        return
+
+    # Respuesta por defecto
+    send_whatsapp_message(user, f"🤖 Escribiste: {text}\nUsa */help* para ver opciones.")
 
 
-# --- Rutas de Flask (Webhook) ---
 
+# -----------------------------
+#     WEBHOOKS
+# -----------------------------
 @app.route("/webhook", methods=["GET"])
-def handle_verification():
-    """Maneja la verificación inicial del Webhook."""
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+def verify():
+    if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        return request.args.get("hub.challenge")
+    return "No autorizado", 403
 
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        app.logger.info("Webhook VERIFICADO correctamente")
-        return challenge, 200
-    else:
-        app.logger.error("Error de verificación: Token o modo incorrectos")
-        return jsonify({"message": "Verificación fallida"}), 403
 
 
 @app.route("/webhook", methods=["POST"])
-def handle_messages():
-    """Maneja los mensajes entrantes de WhatsApp."""
+def webhook():
     data = request.json
-    
-    # El mensaje de depuración es CRUCIAL para ver la data en el log de Render
-    app.logger.info(f"Datos recibidos del Webhook: {json.dumps(data, indent=2)}")
-    
+
     try:
-        # Navegación profunda al cuerpo del mensaje
-        entry = data.get('entry', [{}])[0]
-        change = entry.get('changes', [{}])[0]
-        value = change.get('value', {})
-        messages = value.get('messages', [])
+        entry = data["entry"][0]
+        event = entry["changes"][0]["value"]
 
-        if messages:
-            message_data = messages[0]
-            sender_id = message_data.get('from')
-            message_type = message_data.get('type')
+        if "messages" in event:
+            msg = event["messages"][0]
+            sender = msg["from"]
 
-            if message_type == 'text':
-                message_text = message_data['text']['body']
-                
-                app.logger.info(f"Mensaje de {sender_id}: {message_text}")
+            if msg["type"] == "text":
+                body = msg["text"]["body"]
+                handle_commands(sender, body)
 
-                handle_commands(sender_id, message_text)
-            
-            # Procesar otros tipos de mensajes (imágenes, stickers) para enviar una respuesta de texto por defecto
-            elif message_type in ['image', 'sticker', 'audio']:
-                default_response = "Gracias por el archivo. Por ahora, solo puedo procesar comandos de texto como */help*."
-                app.logger.info(f"Recibido {message_type} de {sender_id}")
-                send_whatsapp_message(sender_id, default_response)
-                
-        
     except Exception as e:
-        app.logger.error(f"Error general al procesar el mensaje: {e}", exc_info=True)
-        # Es vital retornar 200 OK incluso si hay un error en el procesamiento interno
-        # para evitar que Meta siga enviando la notificación.
-    
-    return "OK", 200 
+        print("Error:", e)
+
+    return "OK", 200
+
+
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
